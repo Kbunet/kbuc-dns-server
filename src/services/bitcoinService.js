@@ -88,8 +88,24 @@ async function getProfile(profileId) {
   }
 }
 
+/**
+ * Get all domain profiles from the Bitcoin node
+ * @returns {Promise<Object>} - Object containing domains array and total count
+ */
+async function getDomainProfiles() {
+  try {
+    const result = await rpcCall('getdomainprofiles', []);
+    logger.info(`Retrieved ${result.total} domain profiles from Bitcoin node`);
+    return result;
+  } catch (error) {
+    logger.error(`Failed to get domain profiles: ${error.message}`);
+    throw error;
+  }
+}
+
 module.exports = {
   rpcCall,
   getProfileIdByName,
-  getProfile
+  getProfile,
+  getDomainProfiles
 };

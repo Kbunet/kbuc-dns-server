@@ -3,7 +3,6 @@ const logger = require('../utils/logger');
 const Domain = require('../models/domain');
 const bitcoinService = require('../services/bitcoinService');
 const cryptoUtils = require('../utils/cryptoUtils'); // Import cryptoUtils
-const fallbackController = require('./fallbackController');
 
 // Initialize caches
 const domainCache = new NodeCache({ stdTTL: process.env.DOMAIN_CACHE_TTL || 3600 });
@@ -21,48 +20,14 @@ exports.getDomainCache = () => domainCache;
  */
 exports.getNotFoundCache = () => notFoundCache;
 
-
-
-/**
- * Check if an IP address is valid and not empty
- * @param {string} ip - IP address to validate
- * @returns {boolean} - True if IP is valid, false otherwise
- */
-function isValidIP(ip) {
-  if (!ip || typeof ip !== 'string' || ip.trim() === '') {
-    return false;
-  }
-  
-  const trimmedIP = ip.trim();
-  
-  // Reject 0.0.0.0 as it's not a valid routable IP
-  if (trimmedIP === '0.0.0.0') {
-    return false;
-  }
-  
-  // Basic IP validation (IPv4)
-  const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-  return ipv4Regex.test(trimmedIP);
-}
-
-/**
- * Get the default IP address from environment variables
- * @returns {string} - Default IP address
- */
-function getDefaultIP() {
-  return process.env.DEFAULT_IP || '31.187.76.220';
-}
-
-
 /**
  * Resolve domain name to IP address
  * @param {Object} req - Express request object
  * @param {Object} res - Express response object
  */
 exports.resolveDomain = async (req, res) => {
-  const { domainName } = req.params;
-  
   try {
+    const { domainName } = req.params;
     
     if (!domainName) {
       return res.status(400).json({ error: 'Domain name is required' });
@@ -72,27 +37,25 @@ exports.resolveDomain = async (req, res) => {
     
     // Check if domain is in the not found cache
     if (notFoundCache.has(domainName)) {
-      const defaultIP = getDefaultIP();
-      logger.info(`Domain ${domainName} found in not-found cache, returning default IP: ${defaultIP}`);
-      return res.json({ ip: defaultIP });
+      logger.info(`Domain ${domainName} found in not-found cache`);
+      return res.status(404).json({ error: 'Domain not found' });
     }
     
     // Check if domain is in the available domains cache
     if (domainCache.has(domainName)) {
-      const ip = isValidIP(cachedDomain.link) ? cachedDomain.link : getDefaultIP();
-      logger.info(`Domain ${domainName} found in cache, IP: ${ip}${ip === getDefaultIP() ? ' (default)' : ''}`);
-      return res.json({ ip });
+      const cachedDomain = domainCache.get(domainName);
+      logger.info(`Domain ${domainName} found in cache, IP: ${cachedDomain.link}`);
+      return res.json({ ip: cachedDomain.link });
     }
     
     // Check if domain is in the database
     let domain = await Domain.findOne({ name: domainName });
     
     if (domain) {
-      const ip = isValidIP(domain.link) ? domain.link : getDefaultIP();
-      logger.info(`Domain ${domainName} found in database, IP: ${ip}${ip === getDefaultIP() ? ' (default)' : ''}`);
+      logger.info(`Domain ${domainName} found in database, IP: ${domain.link}`);
       // Add to cache
       domainCache.set(domainName, domain);
-      return res.json({ ip });
+      return res.json({ ip: domain.link });
     }
     
     // Query the Bitcoin node
@@ -101,20 +64,10 @@ exports.resolveDomain = async (req, res) => {
       const profile = await bitcoinService.getProfileIdByName(domainName);
       
       if (!profile || profile.isDomain !== true) {
-        logger.info(`Domain ${domainName} not found in Bitcoin node or is not a domain, trying standard DNS`);
-        
-        // Try fallback resolution with standard DNS
-        const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-        
-        if (fallbackResult) {
-          logger.info(`Domain ${domainName} resolved via standard DNS fallback to ${fallbackResult.ip}`);
-          return res.json({ ip: fallbackResult.ip });
-        }
-        
-        // If fallback also fails, return default IP
-        logger.info(`Domain ${domainName} not found in standard DNS either, returning default IP`);
-        const defaultIP = getDefaultIP();
-        return res.json({ ip: defaultIP });
+        logger.info(`Domain ${domainName} not found in Bitcoin node or is not a domain`);
+        // Cache as not found
+        notFoundCache.set(domainName, true);
+        return res.status(404).json({ error: 'Domain not found' });
       }
       
       // Save to database
@@ -145,32 +98,17 @@ exports.resolveDomain = async (req, res) => {
       // Add to cache
       domainCache.set(domainName, domain);
       
-      const ip = isValidIP(domain.link) ? domain.link : getDefaultIP();
-      logger.info(`Domain ${domainName} found in Bitcoin node, IP: ${ip}${ip === getDefaultIP() ? ' (default)' : ''}`);
-      return res.json({ ip });
+      logger.info(`Domain ${domainName} found in Bitcoin node, IP: ${domain.link}`);
+      return res.json({ ip: domain.link });
     } catch (error) {
       logger.error(`Error querying Bitcoin node: ${error.message}`);
-      
-      // Try fallback resolution with standard DNS
-      const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-      
-      if (fallbackResult) {
-        logger.info(`Domain ${domainName} resolved via standard DNS fallback after Bitcoin error to ${fallbackResult.ip}`);
-        return res.json({ ip: fallbackResult.ip });
-      }
-      
-      // Return default IP instead of 404
-      const defaultIP = getDefaultIP();
-      logger.info(`Domain ${domainName} not found, returning default IP: ${defaultIP}`);
-      return res.json({ ip: defaultIP });
+      // Cache as not found
+      notFoundCache.set(domainName, true);
+      return res.status(404).json({ error: 'Domain not found' });
     }
   } catch (error) {
-    // logger.error(`Error resolving domain: ${error.message}`);
-    // return res.status(500).json({ error: 'Internal server error' });
-    // Return default IP instead of 404
-    const defaultIP = getDefaultIP();
-    logger.info(`Domain ${domainName} not found, returning default IP: ${defaultIP}`);
-    return res.json({ ip: defaultIP });
+    logger.error(`Error resolving domain: ${error.message}`);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 
@@ -198,14 +136,8 @@ exports.getDomainProfile = async (req, res) => {
     // Check if domain is in the available domains cache
     if (domainCache.has(domainName)) {
       const cachedDomain = domainCache.get(domainName);
-      if (!cachedDomain) {
-        logger.warn(`Domain ${domainName} found in cache but cached data is null/undefined`);
-        domainCache.del(domainName);
-      } else {
-        const ip = isValidIP(cachedDomain.link) ? cachedDomain.link : getDefaultIP();
-        logger.info(`Domain ${domainName} found in cache, IP: ${ip}${ip === getDefaultIP() ? ' (default)' : ''}`);
-        return res.json({ ip });
-      }
+      logger.info(`Domain ${domainName} found in cache`);
+      return res.json(cachedDomain);
     }
     
     // Check if domain is in the database
@@ -225,15 +157,6 @@ exports.getDomainProfile = async (req, res) => {
       
       if (!profile || profile.isDomain !== true) {
         logger.info(`Domain ${domainName} not found in Bitcoin node or is not a domain`);
-        
-        // Try fallback resolution with standard DNS for profile info
-        const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-        
-        if (fallbackResult && fallbackResult.domain) {
-          logger.info(`Domain ${domainName} profile retrieved via standard DNS fallback`);
-          return res.json(fallbackResult.domain);
-        }
-        
         // Cache as not found
         notFoundCache.set(domainName, true);
         return res.status(404).json({ error: 'Domain not found' });
@@ -271,15 +194,6 @@ exports.getDomainProfile = async (req, res) => {
       return res.json(domain);
     } catch (error) {
       logger.error(`Error querying Bitcoin node: ${error.message}`);
-      
-      // Try fallback resolution with standard DNS for profile info
-      const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-      
-      if (fallbackResult && fallbackResult.domain) {
-        logger.info(`Domain ${domainName} profile retrieved via standard DNS fallback after Bitcoin error`);
-        return res.json(fallbackResult.domain);
-      }
-      
       // Cache as not found
       notFoundCache.set(domainName, true);
       return res.status(404).json({ error: 'Domain not found' });
@@ -314,33 +228,6 @@ exports.refreshDomain = async (domainName) => {
       
       if (!profile || profile.isDomain !== true) {
         logger.info(`Domain ${domainName} no longer exists in Bitcoin node or is not a domain`);
-        
-        // Check if this was a standard DNS domain
-        const appData = domain.appData ? 
-          (typeof domain.appData === 'string' ? JSON.parse(domain.appData) : domain.appData) : 
-          {};
-          
-        if (appData.source === 'standard_dns') {
-          // If it was from standard DNS, try to refresh from standard DNS
-          const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-          
-          if (fallbackResult) {
-            logger.info(`Domain ${domainName} refreshed via standard DNS to ${fallbackResult.ip}`);
-            
-            // Update the domain with new IP if different
-            if (domain.link !== fallbackResult.ip) {
-              domain.link = fallbackResult.ip;
-              await domain.save();
-              
-              // Update cache if present
-              if (domainCache.has(domainName)) {
-                domainCache.set(domainName, domain);
-              }
-            }
-            
-            return domain;
-          }
-        }
         
         // Remove from cache if present
         if (domainCache.has(domainName)) {
@@ -385,34 +272,6 @@ exports.refreshDomain = async (domainName) => {
       return domain;
     } catch (error) {
       logger.error(`Error refreshing domain ${domainName} from Bitcoin node: ${error.message}`);
-      
-      // Check if this was a standard DNS domain
-      const appData = domain.appData ? 
-        (typeof domain.appData === 'string' ? JSON.parse(domain.appData) : domain.appData) : 
-        {};
-        
-      if (appData.source === 'standard_dns') {
-        // If it was from standard DNS, try to refresh from standard DNS
-        const fallbackResult = await fallbackController.tryFallbackResolution(domainName);
-        
-        if (fallbackResult) {
-          logger.info(`Domain ${domainName} refreshed via standard DNS after Bitcoin error to ${fallbackResult.ip}`);
-          
-          // Update the domain with new IP if different
-          if (domain.link !== fallbackResult.ip) {
-            domain.link = fallbackResult.ip;
-            await domain.save();
-            
-            // Update cache if present
-            if (domainCache.has(domainName)) {
-              domainCache.set(domainName, domain);
-            }
-          }
-          
-          return domain;
-        }
-      }
-      
       return domain; // Return the existing domain without updates
     }
   } catch (error) {
